@@ -191,7 +191,7 @@ pub fn map_reduce<
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerKind {
     Map,
     Reduce,
@@ -206,10 +206,11 @@ enum WorkerStatus {
 
 enum TaskStatusKind {
     Idle,
-    InProgress,
+    InProgress { worker_id: usize },
     Completed,
 }
 
+#[derive(Eq, PartialEq)]
 enum TaskKind {
     Map,
     Reduce,
@@ -217,7 +218,6 @@ enum TaskKind {
 
 struct Task {
     id: usize,
-    worker_id: Option<usize>,
     status: TaskStatusKind,
     kind: TaskKind,
     input: PathBuf,
@@ -227,7 +227,6 @@ impl Task {
     pub fn new(id: usize, kind: TaskKind, input: PathBuf) -> Self {
         Self {
             id,
-            worker_id: None,
             status: TaskStatusKind::Idle,
             kind,
             input,
@@ -253,6 +252,8 @@ impl Worker {
         }
     }
 
+    pub fn assign_task(&mut self, task: Arc<Mutex<Task>>) {}
+
     pub fn ping(&self) -> Result<(), ()> {
         Err(())
     }
@@ -263,44 +264,89 @@ impl Worker {
 enum CommMessage {
     Ping { worker_id: usize },
     Pong { worker_id: usize },
+    TaskCompleted { task_id: usize },
 }
 
-trait CommunicationChannel: Sync + Send {
-    fn send(&self) -> std::io::Result<()>;
-    fn listen(&self) -> Result<CommMessage, ()>;
+trait MyChannel {
+    type Item;
+
+    fn send(&self, t: Self::Item) -> Result<(), ()>;
+    fn receive(&self) -> Result<Self::Item, ()>;
 }
 
-struct SimpleMPSCChannel {}
-
-impl SimpleMPSCChannel {
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-impl CommunicationChannel for SimpleMPSCChannel {
-    fn listen(&self) -> Result<CommMessage, ()> {
+impl MyChannel for (mpsc::Sender<CommMessage>, mpsc::Receiver<CommMessage>) {
+    type Item = CommMessage;
+    fn receive(&self) -> Result<Self::Item, ()> {
         Err(())
     }
 
-    fn send(&self) -> std::io::Result<()> {
+    fn send(&self, t: Self::Item) -> Result<(), ()> {
         Ok(())
     }
 }
 
+trait MessageSender {
+    type Item;
+    fn send(&self, t: Self::Item) -> Result<(), ()>;
+}
+
+trait MessageReceiver {
+    type Item;
+    fn receive(&self) -> Result<Self::Item, ()>;
+}
+
+impl MessageSender for mpsc::Sender<CommMessage> {
+    type Item = CommMessage;
+
+    fn send(&self, t: Self::Item) -> Result<(), ()> {
+        Ok(())
+    }
+}
+
+impl MessageReceiver for mpsc::Receiver<CommMessage> {
+    type Item = CommMessage;
+    fn receive(&self) -> Result<Self::Item, ()> {
+        Err(())
+    }
+}
+
 struct Master {
-    comm_channel: Arc<dyn CommunicationChannel>,
-    tasks: Arc<HashMap<usize, Arc<Mutex<Task>>>>,
+    comm_channel: (
+        Box<dyn MessageSender<Item = CommMessage>>,
+        Box<dyn MessageReceiver<Item = CommMessage>>,
+    ),
+    pending_tasks: Arc<HashMap<usize, Arc<Mutex<Task>>>>,
+    completed_tasks: Arc<HashMap<usize, Arc<Mutex<Task>>>>,
     workers: Arc<HashMap<usize, Arc<Mutex<Worker>>>>,
+    workers_pool_size: usize,
+    map_chunk_size: usize,
+    total_input_size: usize,
 }
 
 impl Master {
-    pub fn new(input: PathBuf, worker_size: Option<usize>, map_chunk_size: Option<usize>) -> Self {
-        let comm_channel = Arc::new(SimpleMPSCChannel::new());
+    pub fn new(
+        comm_channel: (
+            Box<dyn MessageSender<Item = CommMessage>>,
+            Box<dyn MessageReceiver<Item = CommMessage>>,
+        ),
+        worker_size: Option<usize>,
+        map_chunk_size: Option<usize>,
+    ) -> Self {
+        Self {
+            comm_channel,
+            pending_tasks: Arc::new(HashMap::new()),
+            completed_tasks: Arc::new(HashMap::new()),
+            workers: Arc::new(HashMap::new()),
+            workers_pool_size: worker_size.unwrap_or(10), // export to config
+            map_chunk_size: map_chunk_size.unwrap_or(512), // export to config
+            total_input_size: 0,
+        }
+    }
 
+    fn split_input_to_tasks(&mut self, input: PathBuf) -> Arc<HashMap<usize, Arc<Mutex<Task>>>> {
         let mut tasks = Arc::new(HashMap::new());
 
-        split_file_to_chunks(input, map_chunk_size.unwrap_or(512))
+        split_file_to_chunks(input, self.map_chunk_size)
             .into_iter()
             .enumerate()
             .for_each(|(task_id, task_input)| {
@@ -309,17 +355,7 @@ impl Master {
                 tasks.insert(task_id, task);
             });
 
-        let mut master = Self {
-            comm_channel,
-            tasks,
-            workers: Arc::new(HashMap::new()),
-        };
-
-        let worker_size = worker_size.unwrap_or(10);
-        master.spawn_multiple(WorkerKind::Map, worker_size);
-        master.spawn_multiple(WorkerKind::Reduce, worker_size);
-
-        master
+        tasks
     }
 
     pub fn spawn(&mut self, kind: WorkerKind) {
@@ -335,26 +371,111 @@ impl Master {
         })
     }
 
-    pub fn listen(&mut self) -> std::io::Result<()> {
-        let comm_channel = Arc::clone(&self.comm_channel);
+    pub fn schedule_tasks(&mut self) -> std::io::Result<()> {
+        loop {
+            if self.completed_tasks.len() >= self.total_input_size {
+                // all tasks completed
+                break;
+            }
+
+            let pending_tasks = Arc::clone(&self.pending_tasks);
+            let mut pending_tasks = pending_tasks.values();
+            while let Some(r_pending_task) = pending_tasks.next() {
+                let pending_task = Arc::clone(r_pending_task);
+                let pending_task = pending_task.lock().unwrap();
+                match pending_task.status {
+                    TaskStatusKind::Idle => {
+                        let worker_kind = if pending_task.kind == TaskKind::Map {
+                            WorkerKind::Map
+                        } else {
+                            WorkerKind::Reduce
+                        };
+
+                        let worker = self.get_idle_worker(worker_kind);
+                        let mut worker = worker.lock().unwrap();
+                        worker.assign_task(Arc::clone(&r_pending_task))
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn get_idle_worker(&self, worker_kind: WorkerKind) -> Arc<Mutex<Worker>> {
+        // current assumption is that there is more worker than there will be task
+        // so we would always be able to get an idle worker
+        // to relax assumption, we need to use some sort of resource manager to
+        // guard getting an idle worker. e.g use a semaphore here that yields
+        // control back to executor and continues execution back as soon as there's an
+        // idle worker available to process task
         let workers = Arc::clone(&self.workers);
+        let worker = workers.values().find(|w: &&Arc<Mutex<Worker>>| {
+            let worker = w.lock().unwrap();
+            worker.status == WorkerStatus::Idle && worker.kind == worker_kind
+        });
+
+        Arc::clone(worker.unwrap())
+    }
+
+    pub fn run(&mut self, input: PathBuf) -> std::io::Result<()> {
+        // spin up workers
+        self.spawn_multiple(WorkerKind::Map, self.workers_pool_size);
+        self.spawn_multiple(WorkerKind::Reduce, self.workers_pool_size);
+
+        // populate pending tasks
+        self.pending_tasks = self.split_input_to_tasks(input);
+        self.total_input_size = self.pending_tasks.len();
+
+        // let reciever = self.comm_channel.1;
+        let workers = Arc::clone(&self.workers);
+        let mut pending_tasks = Arc::clone(&self.pending_tasks);
+        let mut completed_tasks = Arc::clone(&self.completed_tasks);
         let listener_handle = thread::spawn(move || {
             let workers = Arc::clone(&workers);
 
-            while let Ok(msg) = comm_channel.listen() {
-                match msg {
-                    CommMessage::Pong { worker_id } => {
-                        if let Some(worker) = workers.get(&worker_id) {
-                            let mut worker = worker.lock().unwrap();
-                            worker.status = WorkerStatus::Busy;
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            // while let Ok(msg) = reciever.receive() {
+            //     match msg {
+            //         CommMessage::Pong { worker_id } => {
+            //             if let Some(worker) = workers.get(&worker_id) {
+            //                 let mut worker = worker.lock().unwrap();
+            //                 worker.status = WorkerStatus::Busy;
+            //             }
+            //         }
+            //         CommMessage::TaskCompleted { task_id } => {
+            //             let pending_tasks_ref = Arc::clone(&pending_tasks);
+            //             let pending_tasks_mut = Arc::get_mut(&mut pending_tasks).unwrap();
+
+            //             if let Some(r_task) = pending_tasks_ref.get(&task_id) {
+            //                 let mut task = r_task.lock().unwrap();
+            //                 match task.kind {
+            //                     TaskKind::Map => {
+            //                         // prepare for reduce and change status to idle so the scheduler can pick it up
+            //                         task.kind = TaskKind::Reduce;
+            //                         task.status = TaskStatusKind::Idle;
+            //                     }
+            //                     TaskKind::Reduce => {
+            //                         // remove from pending task and insert into the completed task list
+            //                         pending_tasks_mut.remove(&task_id);
+            //                         let completed_tasks =
+            //                             Arc::get_mut(&mut completed_tasks).unwrap();
+            //                         completed_tasks.insert(task_id, Arc::clone(r_task));
+            //                     }
+            //                 }
+            //             } else {
+            //                 println!(
+            //                     "[CommMessage::TaskCompleted] task with id: `{}` not found",
+            //                     task_id
+            //                 )
+            //             }
+            //         }
+            //         _ => {}
+            //     }
+            // }
         });
 
-        let tasks = Arc::clone(&self.tasks);
+        let tasks = Arc::clone(&self.pending_tasks);
         let mut workers = Arc::clone(&self.workers);
         let ping_handle = thread::spawn(move || loop {
             let workers_clone = Arc::clone(&workers);
@@ -366,7 +487,6 @@ impl Master {
                             // if worker has task, reset task worker id, and status back to Idle so other workers can pick it up
                             if let Some(task) = tasks.get(&task_id) {
                                 let mut task = task.lock().unwrap();
-                                task.worker_id = None;
                                 task.status = TaskStatusKind::Idle;
                             }
                         }
@@ -392,6 +512,8 @@ impl Master {
             sleep(Duration::from_millis(PING_CYCLE_DELAY))
         });
 
+        self.schedule_tasks()?;
+
         let _ = listener_handle.join();
         let _ = ping_handle.join();
 
@@ -413,9 +535,10 @@ impl MapReduce {
             >,
         >,
     ) -> std::io::Result<()> {
-        let mut master = Master::new(file, None, None);
+        let (sender, receiver) = mpsc::channel::<CommMessage>();
 
-        master.listen()?;
+        let mut master = Master::new((Box::new(sender), Box::new(receiver)), None, None);
+        master.run(file)?;
 
         Ok(())
     }
