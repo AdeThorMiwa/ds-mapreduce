@@ -19,11 +19,11 @@ impl WorkerPool {
 
     pub async fn spawn(&self, sender: broadcast::Sender<WorkerMessage>) {
         for _ in 0..self.size {
-            self.spawn_kind(sender.clone()).await;
+            self.spawn_single(sender.clone()).await;
         }
     }
 
-    pub async fn spawn_kind(&self, sender: broadcast::Sender<WorkerMessage>) {
+    pub async fn spawn_single(&self, sender: broadcast::Sender<WorkerMessage>) {
         let workers = self.workers.clone();
         let mut workers = workers.lock().await;
         let worker_id = workers.len();

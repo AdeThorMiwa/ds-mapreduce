@@ -2,17 +2,8 @@ use crate::master::Master;
 use std::path::PathBuf;
 
 pub trait MapReducer {
-    type MapKey;
-    type MapValue;
-    type ReduceKey;
-    type ReduceValue;
-
-    fn map(
-        &self,
-        key: Self::MapKey,
-        value: Self::MapValue,
-    ) -> Vec<(Self::ReduceKey, Self::ReduceValue)>;
-    fn reduce(&self, key: Self::ReduceKey, value: Vec<Self::ReduceValue>) -> Self::ReduceValue;
+    fn map(&self, key: String, value: String) -> Vec<(String, String)>;
+    fn reduce(&self, key: String, value: Vec<String>) -> String;
 }
 
 pub struct MapReduce;

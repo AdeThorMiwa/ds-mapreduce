@@ -1,4 +1,4 @@
-use crate::task::{Task, TaskStatusKind};
+use crate::task::{Task, TaskKind, TaskStatusKind};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 
@@ -17,7 +17,7 @@ impl TaskManager {
         let mut tasks = Vec::new();
         let all_tasks = self.tasks.lock().await;
         for task in all_tasks.values() {
-            if let TaskStatusKind::InProgress { .. } = task.lock().await.status {
+            if let TaskStatusKind::Idle = task.lock().await.status {
                 tasks.push(task.clone())
             }
         }
@@ -60,11 +60,12 @@ impl TaskManager {
         }
     }
 
-    pub async fn move_task_to_idle(&self, task_id: usize, output: String) {
+    pub async fn prepare_task_for_reduce(&self, task_id: usize, output: String) {
         if let Some(task) = self.tasks.lock().await.get(&task_id) {
             let mut task = task.lock().await;
             task.status = TaskStatusKind::Idle;
-            task.input = PathBuf::from(output)
+            task.input = PathBuf::from(output);
+            task.kind = TaskKind::Reduce;
         }
     }
 }

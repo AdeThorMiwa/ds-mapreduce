@@ -1,9 +1,9 @@
 use crate::{
-    constants::PING_CYCLE_DELAY,
+    constants::{DEFAULT_INPUT_SPLIT_SIZE, PING_CYCLE_DELAY},
     task::{Task, TaskKind, TaskStatusKind},
     task_manager::TaskManager,
     utils::split_file_to_chunks,
-    worker::{WorkerMessage, WorkerStatus},
+    worker::{WorkerMessage, WorkerMessageKind, WorkerStatus},
     worker_pool::WorkerPool,
 };
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -13,19 +13,19 @@ pub struct Master {
     sender: broadcast::Sender<WorkerMessage>,
     task_manager: TaskManager,
     worker_pool: WorkerPool,
-    map_chunk_size: usize,
+    input_split_size: usize,
     total_input_size: usize,
     enable_ping: bool,
 }
 
 impl Master {
-    pub fn new(worker_size: Option<usize>, map_chunk_size: Option<usize>) -> Self {
+    pub fn new(worker_size: Option<usize>, input_split_size: Option<usize>) -> Self {
         let (sender, ..) = broadcast::channel(100);
         Self {
             sender,
             task_manager: TaskManager::new(),
             worker_pool: WorkerPool::new(worker_size.unwrap_or(10)),
-            map_chunk_size: map_chunk_size.unwrap_or(512), // export to config
+            input_split_size: input_split_size.unwrap_or(DEFAULT_INPUT_SPLIT_SIZE), // export to config
             total_input_size: 0,
             enable_ping: true,
         }
@@ -34,7 +34,7 @@ impl Master {
     async fn split_input_to_tasks(&mut self, input: PathBuf) -> Vec<Task> {
         let mut tasks = Vec::new();
 
-        split_file_to_chunks(input, self.map_chunk_size)
+        split_file_to_chunks(input, self.input_split_size)
             .await
             .into_iter()
             .enumerate()
@@ -81,10 +81,15 @@ impl Master {
             }
 
             let pending_tasks = self.task_manager.get_pending_tasks().await;
-            let mut pending_tasks = pending_tasks.iter();
-            while let Some(r_task) = pending_tasks.next() {
-                let task = r_task.lock().await;
-                if task.status == TaskStatusKind::Idle {
+            for r_task in pending_tasks {
+                let task_status = {
+                    let task = r_task.lock().await;
+                    let status = task.status.clone();
+                    drop(task);
+                    status
+                };
+
+                if task_status == TaskStatusKind::Idle {
                     let (worker, permit) = self.worker_pool.get_idle_worker().await;
                     worker
                         .lock()
@@ -126,20 +131,15 @@ impl Master {
         tokio::spawn(async move {
             loop {
                 if let Ok(msg) = receiver.recv().await {
-                    match msg {
-                        WorkerMessage::TaskCompleted {
-                            worker_id,
+                    match msg.kind {
+                        WorkerMessageKind::TaskCompleted {
                             task_id,
                             output,
+                            worker_id,
                         } => {
                             if let Some(r_task) = task_manager.get_task_by_id(task_id).await {
-                                println!(
-                                    "task id: {} output >> {} worker {}",
-                                    task_id, output, worker_id
-                                );
-
                                 if r_task.lock().await.kind == TaskKind::Map {
-                                    task_manager.move_task_to_idle(task_id, output).await;
+                                    task_manager.prepare_task_for_reduce(task_id, output).await;
                                 } else {
                                     task_manager.move_task_to_completed(task_id).await;
                                 }

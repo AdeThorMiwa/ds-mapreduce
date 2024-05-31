@@ -5,9 +5,8 @@ use crate::{
     task::{Task, TaskKind},
     utils::{get_file_name, retrieve_parsed_intermediate_file, write_result},
 };
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{collections::HashMap, fs::read_to_string, path::PathBuf, sync::Arc, time::Duration};
 use tokio::{
-    fs::read_to_string,
     sync::{broadcast, Mutex, Notify, OwnedSemaphorePermit},
     task::JoinHandle,
     time::timeout,
@@ -27,20 +26,26 @@ pub enum WorkerStatus {
 }
 
 #[derive(Clone, Debug)]
-pub enum WorkerMessage {
+pub enum WorkerMessageKind {
     Ping {
         notifier: Arc<Notify>,
     },
     TaskCompleted {
-        worker_id: usize,
         task_id: usize,
         output: String,
+        worker_id: usize,
     },
     NewTask {
         task_id: usize,
         input: PathBuf,
         kind: TaskKind,
     },
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkerMessage {
+    pub worker_id: Option<usize>,
+    pub kind: WorkerMessageKind,
 }
 
 #[derive(Debug)]
@@ -68,27 +73,37 @@ impl Worker {
     }
 
     fn create_task_runner(worker_id: usize, s: broadcast::Sender<WorkerMessage>) -> JoinHandle<()> {
-        println!("spawing worker with id: {}", worker_id);
         let mut r = s.subscribe();
         tokio::spawn(async move {
             loop {
                 if let Ok(msg) = r.recv().await {
-                    match msg {
-                        WorkerMessage::NewTask {
-                            task_id,
-                            input,
-                            kind,
-                        } => {
-                            if kind == TaskKind::Map {
-                                Self::map_runner(input, task_id, worker_id, s.clone()).await;
-                            } else {
-                                Self::reduce_runner(input, task_id, worker_id, s.clone()).await;
+                    // TODO: figure out a better way to structure this, its weird
+                    if let Some(w_id) = msg.worker_id {
+                        if w_id == worker_id {
+                            match msg.kind {
+                                WorkerMessageKind::NewTask {
+                                    task_id,
+                                    input,
+                                    kind,
+                                } => {
+                                    if kind == TaskKind::Map {
+                                        Self::map_runner(input, task_id, worker_id, s.clone())
+                                            .await;
+                                    } else {
+                                        Self::reduce_runner(input, task_id, worker_id, s.clone())
+                                            .await;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        WorkerMessage::Ping { notifier } => {
-                            notifier.notify_one();
+                    } else {
+                        match msg.kind {
+                            WorkerMessageKind::Ping { notifier } => {
+                                notifier.notify_one();
+                            }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }
@@ -102,14 +117,17 @@ impl Worker {
         s: broadcast::Sender<WorkerMessage>,
     ) {
         let filename = get_file_name(&input).unwrap();
-        let input = read_to_string(input).await.unwrap();
+        let input = read_to_string(input).unwrap();
         let w = WordCount;
         let result = w.map(filename, input);
         let output = write_result(result, INTERMEDIATE_DIR).await;
-        let msg = WorkerMessage::TaskCompleted {
-            task_id,
-            output,
-            worker_id,
+        let msg = WorkerMessage {
+            worker_id: Some(worker_id),
+            kind: WorkerMessageKind::TaskCompleted {
+                task_id,
+                output,
+                worker_id,
+            },
         };
         s.send(msg).unwrap();
     }
@@ -120,8 +138,7 @@ impl Worker {
         worker_id: usize,
         s: broadcast::Sender<WorkerMessage>,
     ) {
-        let filename = get_file_name(&input).unwrap();
-        let parsed = retrieve_parsed_intermediate_file(&filename).await;
+        let parsed = retrieve_parsed_intermediate_file(&input).await;
         let grouped = Self::group_input(parsed);
 
         let mut reduce_result = Vec::new();
@@ -132,22 +149,25 @@ impl Worker {
         }
 
         let output = write_result(reduce_result, OUTPUT_DIR).await;
-        let msg = WorkerMessage::TaskCompleted {
-            task_id,
-            output,
-            worker_id,
+        let msg = WorkerMessage {
+            worker_id: Some(worker_id),
+            kind: WorkerMessageKind::TaskCompleted {
+                task_id,
+                output,
+                worker_id,
+            },
         };
         s.send(msg).unwrap();
     }
 
-    fn group_input(input: Vec<(String, u32)>) -> HashMap<String, Vec<u32>> {
-        let mut grouped: HashMap<String, Vec<u32>> = HashMap::new();
+    fn group_input(input: Vec<(String, String)>) -> HashMap<String, Vec<String>> {
+        let mut grouped: HashMap<String, Vec<String>> = HashMap::new();
 
         for (key, value) in input {
-            let mut values: Vec<u32> = vec![value];
+            let mut values: Vec<String> = vec![value];
 
             if let Some(value) = grouped.get(&key) {
-                values.extend(value.iter())
+                values.extend(value.into_iter().map(|t| t.to_owned()))
             }
 
             grouped.insert(key, values);
@@ -168,21 +188,26 @@ impl Worker {
         let mut task = task.lock().await;
         task.started(self.id);
 
-        let msg = WorkerMessage::NewTask {
-            task_id: task.id,
-            input: PathBuf::from(&task.input),
-            kind: task.kind,
+        let msg = WorkerMessage {
+            worker_id: Some(self.id),
+            kind: WorkerMessageKind::NewTask {
+                task_id: task.id,
+                input: PathBuf::from(&task.input),
+                kind: task.kind,
+            },
         };
         self.sender.send(msg).unwrap();
     }
 
     pub async fn ping(&mut self) {
         let notifier = Arc::new(Notify::new());
-        self.sender
-            .send(WorkerMessage::Ping {
+        let msg = WorkerMessage {
+            worker_id: None,
+            kind: WorkerMessageKind::Ping {
                 notifier: notifier.clone(),
-            })
-            .unwrap();
+            },
+        };
+        self.sender.send(msg).unwrap();
 
         if let Err(_) = timeout(Duration::from_millis(500), notifier.notified()).await {
             println!("worker {} failed...", self.id);
