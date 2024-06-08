@@ -1,6 +1,7 @@
-use map_reduce::{implm::word_count::WordCount, map_reduce::map_reduce};
+use map_reduce::map_reduce::MapReduce;
 use std::path::PathBuf;
 
-fn main() {
-    map_reduce(PathBuf::from("word.txt"), WordCount)
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+    MapReduce::run(PathBuf::from("word.txt")).await
 }
