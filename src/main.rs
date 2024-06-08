@@ -3,5 +3,9 @@ use std::path::PathBuf;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    MapReduce::run(PathBuf::from("word.txt")).await
+    MapReduce::run(
+        PathBuf::from("word.txt"),
+        PathBuf::from("./implm/word_count.rs"),
+    )
+    .await
 }
