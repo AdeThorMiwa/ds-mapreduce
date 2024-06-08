@@ -9,9 +9,9 @@ pub trait MapReducer {
 pub struct MapReduce;
 
 impl MapReduce {
-    pub async fn run(file: PathBuf) -> std::io::Result<()> {
+    pub async fn run(file: PathBuf, map_reducer_file_path: PathBuf) -> std::io::Result<()> {
         let mut master = Master::new(None, None);
-        master.run(file).await?;
+        master.run(file, map_reducer_file_path).await?;
 
         Ok(())
     }

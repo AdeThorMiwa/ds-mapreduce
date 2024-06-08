@@ -1,11 +1,15 @@
-use crate::worker::{Worker, WorkerMessage, WorkerStatus};
-use std::{collections::HashMap, sync::Arc};
+use crate::{
+    node::manager::NodeManager,
+    worker::{Worker, WorkerMessage, WorkerStatus},
+};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, Mutex, OwnedSemaphorePermit, Semaphore};
 
 pub struct WorkerPool {
     workers: Arc<Mutex<HashMap<usize, Arc<Mutex<Worker>>>>>,
     size: usize,
-    manager: Arc<Semaphore>,
+    resource_manager: Arc<Semaphore>,
+    node_manager: Option<NodeManager>,
 }
 
 impl WorkerPool {
@@ -13,21 +17,31 @@ impl WorkerPool {
         Self {
             workers: Arc::new(Mutex::new(HashMap::new())),
             size,
-            manager: Arc::new(Semaphore::new(size * 2)),
+            resource_manager: Arc::new(Semaphore::new(size * 2)),
+            node_manager: None,
         }
     }
 
-    pub async fn spawn(&self, sender: broadcast::Sender<WorkerMessage>) {
+    pub async fn init_node_manager(&mut self) -> std::io::Result<()> {
+        let node_manager = NodeManager::try_default()
+            .await
+            .expect("unable to initialize node manager");
+        self.node_manager = Some(node_manager);
+        Ok(())
+    }
+
+    pub async fn spawn(&self, actor: PathBuf, sender: broadcast::Sender<WorkerMessage>) {
         for _ in 0..self.size {
-            self.spawn_single(sender.clone()).await;
+            self.spawn_single(actor.clone(), sender.clone()).await;
         }
     }
 
-    pub async fn spawn_single(&self, sender: broadcast::Sender<WorkerMessage>) {
+    pub async fn spawn_single(&self, actor: PathBuf, sender: broadcast::Sender<WorkerMessage>) {
         let workers = self.workers.clone();
         let mut workers = workers.lock().await;
         let worker_id = workers.len();
-        let worker = Worker::new(worker_id, sender.clone());
+        let mut worker = Worker::new(worker_id, sender.clone(), self.node_manager.clone());
+        worker.start(actor).await.expect("unable to start worker");
         workers.insert(worker_id, Arc::new(Mutex::new(worker)));
     }
 
@@ -46,7 +60,7 @@ impl WorkerPool {
     }
 
     pub async fn get_idle_worker(&self) -> (Arc<Mutex<Worker>>, OwnedSemaphorePermit) {
-        let permit_manager = self.manager.clone();
+        let permit_manager = self.resource_manager.clone();
         let permit = permit_manager.acquire_owned().await.unwrap();
 
         // at this point there should be atleast one free (idle) worker
@@ -88,7 +102,8 @@ impl Clone for WorkerPool {
         Self {
             workers: self.workers.clone(),
             size: self.size,
-            manager: self.manager.clone(),
+            resource_manager: self.resource_manager.clone(),
+            node_manager: self.node_manager.clone(),
         }
     }
 }

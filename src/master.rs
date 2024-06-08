@@ -45,8 +45,8 @@ impl Master {
         tasks
     }
 
-    pub async fn spawn_workers(&mut self) {
-        self.worker_pool.spawn(self.sender.clone()).await;
+    pub async fn spawn_workers(&mut self, actor: PathBuf) {
+        self.worker_pool.spawn(actor, self.sender.clone()).await;
     }
 
     pub async fn create_tasks_from_input(&mut self, input: PathBuf) {
@@ -155,9 +155,10 @@ impl Master {
         });
     }
 
-    pub async fn run(&mut self, input: PathBuf) -> std::io::Result<()> {
-        self.spawn_workers().await;
+    pub async fn run(&mut self, input: PathBuf, map_reducer: PathBuf) -> std::io::Result<()> {
+        self.spawn_workers(map_reducer).await;
         self.create_tasks_from_input(input).await;
+        self.worker_pool.init_node_manager().await?;
         self.setup_worker_message_listener().await;
         self.setup_worker_health_monitor().await;
         self.run_scheduler().await?;

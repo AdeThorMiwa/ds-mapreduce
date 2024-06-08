@@ -1,7 +1,7 @@
 use crate::{
     constants::{INTERMEDIATE_DIR, OUTPUT_DIR},
-    implm::word_count::WordCount,
-    map_reduce::MapReducer,
+    container::ContainerManager,
+    node::manager::NodeManager,
     task::{Task, TaskKind},
     utils::{get_file_name, retrieve_parsed_intermediate_file, write_result},
 };
@@ -48,32 +48,92 @@ pub struct WorkerMessage {
     pub kind: WorkerMessageKind,
 }
 
-#[derive(Debug)]
 pub struct Worker {
     pub id: usize,
     pub status: WorkerStatus,
     pub task: Option<Arc<Mutex<Task>>>,
     sender: broadcast::Sender<WorkerMessage>,
-    _task_runner: JoinHandle<()>,
+    _task_runner: Option<JoinHandle<()>>,
     permit: Option<OwnedSemaphorePermit>,
+    node_manager: Option<NodeManager>,
+    node_id: Option<usize>,
+}
+
+impl std::fmt::Debug for Worker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Worker[{}]", self.id)
+    }
 }
 
 impl Worker {
-    pub fn new(id: usize, sender: broadcast::Sender<WorkerMessage>) -> Self {
-        let task_runner = Self::create_task_runner(id, sender.clone());
-
+    pub fn new(
+        id: usize,
+        sender: broadcast::Sender<WorkerMessage>,
+        node_manager: Option<NodeManager>,
+    ) -> Self {
         Self {
             id,
             status: WorkerStatus::Idle,
             task: None,
-            _task_runner: task_runner,
+            _task_runner: None,
             permit: None,
             sender,
+            node_manager,
+            node_id: None,
         }
     }
 
-    fn create_task_runner(worker_id: usize, s: broadcast::Sender<WorkerMessage>) -> JoinHandle<()> {
+    pub async fn start(&mut self, actor_file: PathBuf) -> std::io::Result<()> {
+        let task_runner = if self.node_manager.is_some() {
+            self.bootstrap_node(actor_file).await?
+        } else {
+            self.create_task_runner()
+        };
+
+        self._task_runner = Some(task_runner);
+
+        Ok(())
+    }
+
+    pub fn started(&self) -> bool {
+        self._task_runner.is_some()
+    }
+
+    async fn bootstrap_node(&mut self, actor_file: PathBuf) -> std::io::Result<JoinHandle<()>> {
+        if let Some(mut node_manager) = self.node_manager.clone() {
+            let image = ContainerManager::try_prepare(actor_file, "map_reducer:latest")
+                .expect("unable to create a container image")
+                .containerize()
+                .expect("failed to containerize image");
+
+            let node_id = node_manager.new_node(&image, 1).await;
+            self.node_id = Some(node_id);
+
+            // setup monitoring
+            let s = self.sender.clone();
+            node_manager
+                .watch_node(node_id, |_| async move {
+                    todo!("handle sending back to worker pool here")
+                })
+                .await;
+
+            let mut r = s.subscribe();
+            Ok(tokio::spawn(async move {
+                loop {
+                    if let Ok(_) = r.recv().await {
+                        todo!("forward message to node")
+                    }
+                }
+            }))
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn create_task_runner(&self) -> JoinHandle<()> {
+        let s = self.sender.clone();
         let mut r = s.subscribe();
+        let worker_id = self.id;
         tokio::spawn(async move {
             loop {
                 if let Ok(msg) = r.recv().await {
@@ -116,10 +176,13 @@ impl Worker {
         worker_id: usize,
         s: broadcast::Sender<WorkerMessage>,
     ) {
+        fn map(_t: String, _i: String) -> Vec<(String, String)> {
+            todo!()
+        }
+
         let filename = get_file_name(&input).unwrap();
         let input = read_to_string(input).unwrap();
-        let w = WordCount;
-        let result = w.map(filename, input);
+        let result = map(filename, input);
         let output = write_result(result, INTERMEDIATE_DIR).await;
         let msg = WorkerMessage {
             worker_id: Some(worker_id),
@@ -141,10 +204,13 @@ impl Worker {
         let parsed = retrieve_parsed_intermediate_file(&input).await;
         let grouped = Self::group_input(parsed);
 
+        fn reduce(_clone: String, _values: Vec<String>) -> String {
+            todo!()
+        }
+
         let mut reduce_result = Vec::new();
-        let w = WordCount;
         for (key, values) in grouped.clone() {
-            let value = w.reduce(key.clone(), values);
+            let value = reduce(key.clone(), values);
             reduce_result.push((key, value));
         }
 
@@ -177,7 +243,7 @@ impl Worker {
     }
 
     pub async fn assign_task(&mut self, task: Arc<Mutex<Task>>, permit: OwnedSemaphorePermit) {
-        if self.status != WorkerStatus::Idle {
+        if !self.started() || self.status != WorkerStatus::Idle {
             return;
         }
 
